@@ -1254,6 +1254,12 @@ async fn handle_webhook(
             .await;
     }
 
+    // Persist user message to session backend
+    if let (Some(ref backend), Some(ref sid)) = (&state.session_backend, &session_id) {
+        let user_msg = crate::providers::ChatMessage::user(message);
+        let _ = backend.append(sid, &user_msg);
+    }
+
     let provider_label = state
         .config
         .lock()
@@ -1303,6 +1309,12 @@ async fn handle_webhook(
                     tokens_used: None,
                     cost_usd: None,
                 });
+
+            // Persist assistant response to session backend
+            if let (Some(ref backend), Some(ref sid)) = (&state.session_backend, &session_id) {
+                let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                let _ = backend.append(sid, &assistant_msg);
+            }
 
             let body = serde_json::json!({"response": response, "model": state.model});
             (StatusCode::OK, Json(body))
@@ -1487,6 +1499,12 @@ async fn handle_whatsapp_message(
                 .await;
         }
 
+        // Persist user message to session backend
+        if let Some(ref backend) = state.session_backend {
+            let user_msg = crate::providers::ChatMessage::user(&msg.content);
+            let _ = backend.append(&session_id, &user_msg);
+        }
+
         match Box::pin(run_gateway_chat_with_tools(
             &state,
             &msg.content,
@@ -1495,6 +1513,11 @@ async fn handle_whatsapp_message(
         .await
         {
             Ok(response) => {
+                // Persist assistant response to session backend
+                if let Some(ref backend) = state.session_backend {
+                    let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                    let _ = backend.append(&session_id, &assistant_msg);
+                }
                 // Send reply via WhatsApp
                 if let Err(e) = wa
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1606,6 +1629,12 @@ async fn handle_linq_webhook(
                 .await;
         }
 
+        // Persist user message to session backend
+        if let Some(ref backend) = state.session_backend {
+            let user_msg = crate::providers::ChatMessage::user(&msg.content);
+            let _ = backend.append(&session_id, &user_msg);
+        }
+
         // Call the LLM
         match Box::pin(run_gateway_chat_with_tools(
             &state,
@@ -1615,6 +1644,11 @@ async fn handle_linq_webhook(
         .await
         {
             Ok(response) => {
+                // Persist assistant response to session backend
+                if let Some(ref backend) = state.session_backend {
+                    let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                    let _ = backend.append(&session_id, &assistant_msg);
+                }
                 // Send reply via Linq
                 if let Err(e) = linq
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1721,6 +1755,12 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
                 .await;
         }
 
+        // Persist user message to session backend
+        if let Some(ref backend) = state.session_backend {
+            let user_msg = crate::providers::ChatMessage::user(&msg.content);
+            let _ = backend.append(&session_id, &user_msg);
+        }
+
         // Call the LLM
         match Box::pin(run_gateway_chat_with_tools(
             &state,
@@ -1730,6 +1770,11 @@ async fn handle_wati_webhook(State(state): State<AppState>, body: Bytes) -> impl
         .await
         {
             Ok(response) => {
+                // Persist assistant response to session backend
+                if let Some(ref backend) = state.session_backend {
+                    let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                    let _ = backend.append(&session_id, &assistant_msg);
+                }
                 // Send reply via WATI
                 if let Err(e) = wati
                     .send(&SendMessage::new(response, &msg.reply_target))
@@ -1838,6 +1883,12 @@ async fn handle_nextcloud_talk_webhook(
                 .await;
         }
 
+        // Persist user message to session backend
+        if let Some(ref backend) = state.session_backend {
+            let user_msg = crate::providers::ChatMessage::user(&msg.content);
+            let _ = backend.append(&session_id, &user_msg);
+        }
+
         match Box::pin(run_gateway_chat_with_tools(
             &state,
             &msg.content,
@@ -1846,6 +1897,11 @@ async fn handle_nextcloud_talk_webhook(
         .await
         {
             Ok(response) => {
+                // Persist assistant response to session backend
+                if let Some(ref backend) = state.session_backend {
+                    let assistant_msg = crate::providers::ChatMessage::assistant(&response);
+                    let _ = backend.append(&session_id, &assistant_msg);
+                }
                 if let Err(e) = nextcloud_talk
                     .send(&SendMessage::new(response, &msg.reply_target))
                     .await
