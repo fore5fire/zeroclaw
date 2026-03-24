@@ -161,6 +161,34 @@ impl SessionBackend for SessionStore {
     fn delete_session(&self, session_key: &str) -> std::io::Result<bool> {
         self.delete_session(session_key)
     }
+
+    fn set_reply_route(
+        &self,
+        session_key: &str,
+        channel: &str,
+        reply_target: &str,
+    ) -> std::io::Result<()> {
+        let path = self.session_path(session_key).with_extension("route.json");
+        let data = serde_json::json!({
+            "channel": channel,
+            "reply_target": reply_target,
+        });
+        std::fs::write(path, data.to_string())
+    }
+
+    fn get_reply_route(&self, session_key: &str) -> std::io::Result<Option<(String, String)>> {
+        let path = self.session_path(session_key).with_extension("route.json");
+        let content = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&content).map_err(std::io::Error::other)?;
+        let channel = v["channel"].as_str().map(String::from);
+        let reply_target = v["reply_target"].as_str().map(String::from);
+        Ok(channel.zip(reply_target))
+    }
 }
 
 #[cfg(test)]
