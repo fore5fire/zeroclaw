@@ -320,17 +320,19 @@ impl Tool for SessionsSendTool {
             });
         }
 
-        // Attempt to deliver through the channel if available.
+        // Attempt to deliver through the channel if a reply route is stored.
         let mut delivered = false;
-        if let Some((channel_name, recipient)) = parse_session_channel(session_id) {
+        if let Ok(Some((channel_name, reply_target))) =
+            self.backend.get_reply_route(session_id)
+        {
             // Block-scoped read to drop the parking_lot guard before .await.
             let channel: Option<Arc<dyn Channel>> = {
                 let channels = self.channels.read();
-                channels.get(channel_name).cloned()
+                channels.get(channel_name.as_str()).cloned()
             };
 
             if let Some(ch) = channel {
-                let send_msg = SendMessage::new(message, recipient);
+                let send_msg = SendMessage::new(message, &reply_target);
                 if let Err(e) = ch.send(&send_msg).await {
                     return Ok(ToolResult {
                         success: false,
@@ -740,6 +742,14 @@ mod tests {
     #[tokio::test]
     async fn send_delivers_via_channel_and_injects_history() {
         let (_tmp, backend) = test_backend();
+
+        // Store a reply route so sessions_send knows how to deliver.
+        let session_id = "whatsapp_14403198133";
+        let reply_target = "14403198133@s.whatsapp.net";
+        backend
+            .set_reply_route(session_id, "whatsapp", reply_target)
+            .unwrap();
+
         let channel = Arc::new(MockChannel::new());
         let channels: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
         channels.write().insert("whatsapp".to_string(), channel.clone() as Arc<dyn Channel>);
@@ -754,7 +764,7 @@ mod tests {
 
         let result = tool
             .execute(json!({
-                "session_id": "whatsapp_+1234567890",
+                "session_id": session_id,
                 "message": "Hello from cross-channel"
             }))
             .await
@@ -764,11 +774,11 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("delivered"));
 
-        // Channel's send() was called with correct recipient
+        // Channel's send() was called with the JID reply target, not the session key
         assert!(channel.sent.load(Ordering::SeqCst));
         assert_eq!(
             *channel.last_recipient.lock(),
-            Some("+1234567890".to_string())
+            Some(reply_target.to_string())
         );
         assert_eq!(
             *channel.last_content.lock(),
@@ -776,14 +786,14 @@ mod tests {
         );
 
         // Message was persisted to session backend
-        let messages = backend.load("whatsapp_+1234567890");
+        let messages = backend.load(session_id);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[0].content, "Hello from cross-channel");
 
         // Message was injected into in-memory conversation history
         let histories = history.lock().unwrap();
-        let turns = histories.get("whatsapp_+1234567890").unwrap();
+        let turns = histories.get(session_id).unwrap();
         assert_eq!(turns.len(), 1);
         assert_eq!(turns[0].role, "assistant");
         assert_eq!(turns[0].content, "Hello from cross-channel");

@@ -99,6 +99,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
+use crate::channels::session_backend::SessionBackend as _;
 use crate::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scrub_credentials,
@@ -2474,6 +2475,11 @@ async fn process_channel_message(
             .get(&history_key)
             .is_some_and(|turns| !turns.is_empty())
     };
+
+    // Store the reply route so sessions_send can deliver to this session.
+    if let Some(ref store) = ctx.session_store {
+        let _ = store.set_reply_route(&history_key, &msg.channel, &msg.reply_target);
+    }
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
