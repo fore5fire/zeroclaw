@@ -431,16 +431,32 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     }
 }
 
+/// Sanitize a session key so it matches the filesystem-safe form used by the
+/// JSONL session store.  This ensures keys round-trip through persist→list→load
+/// without mismatch.
+fn sanitize_session_key(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
     // channels) and thread_ts for per-topic isolation in forum groups.
-    match &msg.thread_ts {
+    let raw = match &msg.thread_ts {
         Some(tid) => format!(
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, tid, msg.sender
         ),
         None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
-    }
+    };
+    sanitize_session_key(&raw)
 }
 
 fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
