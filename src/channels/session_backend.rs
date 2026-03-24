@@ -94,6 +94,22 @@ pub trait SessionBackend: Send + Sync {
     fn get_session_name(&self, _session_key: &str) -> std::io::Result<Option<String>> {
         Ok(None)
     }
+
+    /// Store the channel name and reply target for a session so that
+    /// cross-channel tools like `sessions_send` can deliver messages.
+    fn set_reply_route(
+        &self,
+        _session_key: &str,
+        _channel: &str,
+        _reply_target: &str,
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    /// Get the stored channel name and reply target for a session.
+    fn get_reply_route(&self, _session_key: &str) -> std::io::Result<Option<(String, String)>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
