@@ -10644,4 +10644,83 @@ This is an example JSON object for profile settings."#;
 
         assert_eq!(result, clean_text);
     }
+
+    // ── hydrate_histories_from_store tests ──────────────────────────
+
+    #[test]
+    fn hydrate_histories_loads_persisted_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        store
+            .append(
+                "whatsapp_1234567890",
+                &ChatMessage::user("Hello"),
+            )
+            .unwrap();
+        store
+            .append(
+                "whatsapp_1234567890",
+                &ChatMessage::assistant("Hi there"),
+            )
+            .unwrap();
+        store
+            .append(
+                "telegram_bob",
+                &ChatMessage::user("Hey"),
+            )
+            .unwrap();
+
+        let histories = hydrate_histories_from_store(&Some(store));
+
+        assert_eq!(histories.len(), 2);
+        let wa = histories.get("whatsapp_1234567890").unwrap();
+        assert_eq!(wa.len(), 2);
+        assert_eq!(wa[0].role, "user");
+        assert_eq!(wa[1].role, "assistant");
+        let tg = histories.get("telegram_bob").unwrap();
+        assert_eq!(tg.len(), 1);
+    }
+
+    #[test]
+    fn hydrate_histories_returns_empty_without_store() {
+        let histories = hydrate_histories_from_store(&None);
+        assert!(histories.is_empty());
+    }
+
+    #[test]
+    fn hydrate_histories_skips_system_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        store
+            .append("sess1", &ChatMessage::system("System prompt"))
+            .unwrap();
+        store
+            .append("sess1", &ChatMessage::user("Hello"))
+            .unwrap();
+
+        let histories = hydrate_histories_from_store(&Some(store));
+
+        let turns = histories.get("sess1").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "user");
+    }
+
+    #[test]
+    fn hydrate_histories_caps_at_max_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        // Write more than MAX_CHANNEL_HISTORY messages
+        for i in 0..(MAX_CHANNEL_HISTORY + 10) {
+            store
+                .append("sess1", &ChatMessage::user(&format!("msg {i}")))
+                .unwrap();
+        }
+
+        let histories = hydrate_histories_from_store(&Some(store));
+
+        let turns = histories.get("sess1").unwrap();
+        assert_eq!(turns.len(), MAX_CHANNEL_HISTORY);
+        // Should keep the most recent, not the oldest
+        assert_eq!(turns[0].content, format!("msg {}", 10));
+    }
 }
