@@ -546,7 +546,8 @@ mod tests {
     #[tokio::test]
     async fn send_appends_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), empty_history_handle());
+        let history = empty_history_handle();
+        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), Arc::clone(&history));
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -557,17 +558,23 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("Message saved"));
 
-        // Verify message was appended
+        // Verify message was persisted to backend
         let messages = backend.load("telegram__alice");
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[0].content, "Hello from another agent");
+
+        // Verify message was injected into in-memory history
+        let histories = history.lock().unwrap();
+        assert_eq!(histories["telegram__alice"].len(), 1);
+        assert_eq!(histories["telegram__alice"][0].content, "Hello from another agent");
     }
 
     #[tokio::test]
     async fn send_to_existing_session() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), empty_history_handle());
+        let history = empty_history_handle();
+        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), Arc::clone(&history));
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -580,6 +587,12 @@ mod tests {
         let messages = backend.load("telegram__alice");
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[2].content, "Inter-agent message");
+
+        // In-memory history gets the new message even though it wasn't
+        // pre-populated with the seeded backend's messages.
+        let histories = history.lock().unwrap();
+        assert_eq!(histories["telegram__alice"].len(), 1);
+        assert_eq!(histories["telegram__alice"][0].role, "assistant");
     }
 
     #[tokio::test]
@@ -660,4 +673,120 @@ mod tests {
             .unwrap()
             .contains(&json!("message")));
     }
+
+    // ── parse_session_channel tests ────────────────────────────────
+
+    #[test]
+    fn parse_session_channel_extracts_channel_and_recipient() {
+        let (ch, recipient) = parse_session_channel("whatsapp_+1234567890").unwrap();
+        assert_eq!(ch, "whatsapp");
+        assert_eq!(recipient, "+1234567890");
+
+        // Compound recipient: only splits on first underscore
+        let (ch, recipient) = parse_session_channel("telegram_reply_target_user").unwrap();
+        assert_eq!(ch, "telegram");
+        assert_eq!(recipient, "reply_target_user");
+    }
+
+    #[test]
+    fn parse_session_channel_rejects_invalid_ids() {
+        assert!(parse_session_channel("nounderscore").is_none());
+        assert!(parse_session_channel("_recipient").is_none());
+        assert!(parse_session_channel("channel_").is_none());
+    }
+
+    // ── sessions_send channel delivery + in-memory injection tests ─
+
+    use crate::channels::traits::ChannelMessage;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct MockChannel {
+        sent: AtomicBool,
+        last_recipient: parking_lot::Mutex<Option<String>>,
+        last_content: parking_lot::Mutex<Option<String>>,
+    }
+
+    impl MockChannel {
+        fn new() -> Self {
+            Self {
+                sent: AtomicBool::new(false),
+                last_recipient: parking_lot::Mutex::new(None),
+                last_content: parking_lot::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Channel for MockChannel {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.store(true, Ordering::SeqCst);
+            *self.last_recipient.lock() = Some(message.recipient.clone());
+            *self.last_content.lock() = Some(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn send_delivers_via_channel_and_injects_history() {
+        let (_tmp, backend) = test_backend();
+        let channel = Arc::new(MockChannel::new());
+        let channels: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+        channels.write().insert("whatsapp".to_string(), channel.clone() as Arc<dyn Channel>);
+        let history: ConversationHistoryHandle = Arc::new(Mutex::new(HashMap::new()));
+
+        let tool = SessionsSendTool::new(
+            backend.clone(),
+            test_security(),
+            channels,
+            Arc::clone(&history),
+        );
+
+        let result = tool
+            .execute(json!({
+                "session_id": "whatsapp_+1234567890",
+                "message": "Hello from cross-channel"
+            }))
+            .await
+            .unwrap();
+
+        // Tool reported success with delivery confirmation
+        assert!(result.success);
+        assert!(result.output.contains("delivered"));
+
+        // Channel's send() was called with correct recipient
+        assert!(channel.sent.load(Ordering::SeqCst));
+        assert_eq!(
+            *channel.last_recipient.lock(),
+            Some("+1234567890".to_string())
+        );
+        assert_eq!(
+            *channel.last_content.lock(),
+            Some("Hello from cross-channel".to_string())
+        );
+
+        // Message was persisted to session backend
+        let messages = backend.load("whatsapp_+1234567890");
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content, "Hello from cross-channel");
+
+        // Message was injected into in-memory conversation history
+        let histories = history.lock().unwrap();
+        let turns = histories.get("whatsapp_+1234567890").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "assistant");
+        assert_eq!(turns[0].content, "Hello from cross-channel");
+    }
+
 }
