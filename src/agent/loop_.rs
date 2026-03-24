@@ -4443,10 +4443,14 @@ pub async fn run(
 
 /// Process a single message through the full agent (with tools, peripherals, memory).
 /// Used by channels (Telegram, Discord, etc.) to enable hardware and tool use.
+///
+/// When a `session_backend` is provided the agent is hydrated with prior
+/// conversation turns so that webhook-based channels get multi-turn context.
 pub async fn process_message(
     config: Config,
     message: &str,
     session_id: Option<&str>,
+    session_backend: Option<&dyn crate::channels::session_backend::SessionBackend>,
 ) -> Result<String> {
     let observer: Arc<dyn Observer> =
         Arc::from(observability::create_observer(&config.observability));
@@ -4750,10 +4754,19 @@ pub async fn process_message(
         format!("{context}[{now}] {effective_message}")
     };
 
-    let mut history = vec![
-        ChatMessage::system(&system_prompt),
-        ChatMessage::user(&enriched),
-    ];
+    let mut history = vec![ChatMessage::system(&system_prompt)];
+
+    // Hydrate prior conversation turns from session backend (if available).
+    if let (Some(backend), Some(sid)) = (session_backend, session_id) {
+        let prior = backend.load(sid);
+        for msg in prior {
+            if msg.role != "system" {
+                history.push(msg);
+            }
+        }
+    }
+
+    history.push(ChatMessage::user(&enriched));
     let mut excluded_tools = compute_excluded_mcp_tools(
         &tools_registry,
         &config.agent.tool_filter_groups,
