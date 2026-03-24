@@ -4682,7 +4682,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         mut built_tools,
         delegate_handle_ch,
         reaction_handle_ch,
-        _channel_map_handle,
+        channel_map_handle_ch,
         ask_user_handle_ch,
         conversation_history_handle_ch,
     ) = tools::all_tools_with_runtime(
@@ -4975,7 +4975,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .collect::<HashMap<_, _>>(),
     );
 
-    // Populate the reaction tool's channel map now that channels are initialized.
+    // Populate tool channel maps now that channels are initialized.
+    // This shared handle is used by SessionsSendTool and PollTool.
+    {
+        let mut map = channel_map_handle_ch.write();
+        for (name, ch) in channels_by_name.as_ref() {
+            map.insert(name.clone(), Arc::clone(ch));
+        }
+    }
+
     if let Some(ref handle) = reaction_handle_ch {
         let mut map = handle.write();
         for (name, ch) in channels_by_name.as_ref() {
@@ -4983,7 +4991,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    // Populate the ask_user tool's channel map now that channels are initialized.
     if let Some(ref handle) = ask_user_handle_ch {
         let mut map = handle.write();
         for (name, ch) in channels_by_name.as_ref() {
