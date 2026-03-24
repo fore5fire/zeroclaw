@@ -180,7 +180,9 @@ pub use schedule::ScheduleTool;
 pub use schema::{CleaningStrategy, SchemaCleanr};
 pub use screenshot::ScreenshotTool;
 pub use security_ops::SecurityOpsTool;
-pub use sessions::{SessionsHistoryTool, SessionsListTool, SessionsSendTool};
+pub use sessions::{
+    ConversationHistoryHandle, SessionsHistoryTool, SessionsListTool, SessionsSendTool,
+};
 pub use shell::ShellTool;
 #[allow(unused_imports)]
 pub use skill_http::SkillHttpTool;
@@ -345,6 +347,7 @@ pub fn all_tools(
     Option<ChannelMapHandle>,
     ChannelMapHandle,
     Option<ChannelMapHandle>,
+    ConversationHistoryHandle,
 ) {
     all_tools_with_runtime(
         config,
@@ -391,6 +394,7 @@ pub fn all_tools_with_runtime(
     Option<ChannelMapHandle>,
     ChannelMapHandle,
     Option<ChannelMapHandle>,
+    ConversationHistoryHandle,
 ) {
     let has_shell_access = runtime.has_shell_access();
     let sandbox = create_sandbox(&root_config.security);
@@ -726,9 +730,10 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
-    // Late-bound channel map — populated once channels are initialized.
-    // Shared by poll, reaction, ask_user, and sessions_send tools.
+    // Late-bound handles — populated once channels are initialized.
     let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+    let conversation_history_handle: ConversationHistoryHandle =
+        Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     // Session-to-session messaging tools (always available when sessions dir exists)
     if let Ok(session_store) = crate::channels::session_store::SessionStore::new(workspace_dir) {
@@ -743,6 +748,7 @@ pub fn all_tools_with_runtime(
             backend,
             security.clone(),
             Arc::clone(&channel_map_handle),
+            Arc::clone(&conversation_history_handle),
         )));
     }
 
@@ -837,6 +843,7 @@ pub fn all_tools_with_runtime(
                     Some(reaction_handle),
                     channel_map_handle,
                     Some(ask_user_handle),
+                    conversation_history_handle,
                 );
             }
 
@@ -1027,6 +1034,7 @@ pub fn all_tools_with_runtime(
         Some(reaction_handle),
         channel_map_handle,
         Some(ask_user_handle),
+        conversation_history_handle,
     )
 }
 
@@ -1071,7 +1079,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1114,7 +1122,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1268,7 +1276,7 @@ mod tests {
             },
         );
 
-        let (tools, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1302,7 +1310,7 @@ mod tests {
         let http = crate::config::HttpRequestConfig::default();
         let cfg = test_config(&tmp);
 
-        let (tools, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _) = all_tools(
             Arc::new(Config::default()),
             &security,
             mem,
@@ -1337,7 +1345,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Compact;
 
-        let (tools, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
@@ -1372,7 +1380,7 @@ mod tests {
         let mut cfg = test_config(&tmp);
         cfg.skills.prompt_injection_mode = crate::config::SkillsPromptInjectionMode::Full;
 
-        let (tools, _, _, _, _) = all_tools(
+        let (tools, _, _, _, _, _) = all_tools(
             Arc::new(cfg.clone()),
             &security,
             mem,
