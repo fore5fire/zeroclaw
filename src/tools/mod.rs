@@ -726,6 +726,10 @@ pub fn all_tools_with_runtime(
     tool_arcs.push(Arc::new(ScreenshotTool::new(security.clone())));
     tool_arcs.push(Arc::new(ImageInfoTool::new(security.clone())));
 
+    // Late-bound channel map — populated once channels are initialized.
+    // Shared by poll, reaction, ask_user, and sessions_send tools.
+    let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+
     // Session-to-session messaging tools (always available when sessions dir exists)
     if let Ok(session_store) = crate::channels::session_store::SessionStore::new(workspace_dir) {
         let backend: Arc<dyn crate::channels::session_backend::SessionBackend> =
@@ -735,7 +739,11 @@ pub fn all_tools_with_runtime(
             backend.clone(),
             security.clone(),
         )));
-        tool_arcs.push(Arc::new(SessionsSendTool::new(backend, security.clone())));
+        tool_arcs.push(Arc::new(SessionsSendTool::new(
+            backend,
+            security.clone(),
+            Arc::clone(&channel_map_handle),
+        )));
     }
 
     // LinkedIn integration (config-gated)
@@ -760,7 +768,6 @@ pub fn all_tools_with_runtime(
     }
 
     // Poll tool — always registered; uses late-bound channel map handle
-    let channel_map_handle: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
     tool_arcs.push(Arc::new(PollTool::new(
         security.clone(),
         Arc::clone(&channel_map_handle),
