@@ -1172,6 +1172,40 @@ fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
     drop_count
 }
 
+/// Load persisted sessions from the session store into an in-memory history map.
+/// Each session is capped to the most recent [`MAX_CHANNEL_HISTORY`] messages so
+/// the context budget is respected.
+fn hydrate_histories_from_store(
+    store: &Option<Arc<session_store::SessionStore>>,
+) -> HashMap<String, Vec<ChatMessage>> {
+    let Some(store) = store else {
+        return HashMap::new();
+    };
+    let keys = store.list_sessions();
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let mut histories = HashMap::with_capacity(keys.len());
+    for key in &keys {
+        let mut messages = store.load(key);
+        // Only keep non-system messages (system prompt is rebuilt per-turn).
+        messages.retain(|m| m.role != "system");
+        if messages.is_empty() {
+            continue;
+        }
+        // Cap to most recent turns.
+        if messages.len() > MAX_CHANNEL_HISTORY {
+            messages.drain(..messages.len() - MAX_CHANNEL_HISTORY);
+        }
+        histories.insert(key.clone(), messages);
+    }
+    tracing::info!(
+        "Hydrated {} session(s) from persisted store",
+        histories.len()
+    );
+    histories
+}
+
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
     // Persist to JSONL before adding to in-memory history.
     if let Some(ref store) = ctx.session_store {
@@ -4634,6 +4668,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         reaction_handle_ch,
         _channel_map_handle,
         ask_user_handle_ch,
+        conversation_history_handle_ch,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -4974,6 +5009,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
 
+    // ── Session store (created early so we can hydrate conversation history) ──
+    let channel_session_store: Option<Arc<session_store::SessionStore>> =
+        if config.channels_config.session_persistence {
+            match session_store::SessionStore::new(&config.workspace_dir) {
+                Ok(store) => {
+                    tracing::info!("Session persistence enabled");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    tracing::warn!("Session persistence disabled: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -4988,7 +5040,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        conversation_histories: {
+            // Hydrate the shared handle (also held by SessionsSendTool) from
+            // the persisted session store so conversations survive restarts.
+            let hydrated = hydrate_histories_from_store(&channel_session_store);
+            if !hydrated.is_empty() {
+                if let Ok(mut map) = conversation_history_handle_ch.lock() {
+                    *map = hydrated;
+                }
+            }
+            conversation_history_handle_ch
+        },
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -5029,20 +5091,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels_config.ack_reactions,
         show_tool_calls: config.channels_config.show_tool_calls,
-        session_store: if config.channels_config.session_persistence {
-            match session_store::SessionStore::new(&config.workspace_dir) {
-                Ok(store) => {
-                    tracing::info!("📂 Session persistence enabled");
-                    Some(Arc::new(store))
-                }
-                Err(e) => {
-                    tracing::warn!("Session persistence disabled: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        },
+        session_store: channel_session_store.clone(),
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
         cost_tracking: crate::cost::CostTracker::get_or_init_global(

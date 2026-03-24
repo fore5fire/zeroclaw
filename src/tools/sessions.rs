@@ -8,6 +8,7 @@
 use super::traits::{Tool, ToolResult};
 use crate::channels::session_backend::SessionBackend;
 use crate::channels::traits::{Channel, SendMessage};
+use crate::providers::traits::ChatMessage;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
@@ -15,7 +16,7 @@ use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -210,6 +211,10 @@ impl Tool for SessionsHistoryTool {
 /// Shared handle giving tools late-bound access to the live channel map.
 type ChannelMapHandle = Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>;
 
+/// Shared handle for injecting messages into the in-memory conversation history.
+/// Populated by the channel server after startup; empty for gateway-only deployments.
+pub type ConversationHistoryHandle = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
+
 /// Parse a session ID into (channel_name, recipient).
 ///
 /// Session IDs follow the pattern `{channel}_{recipient}` where the channel
@@ -235,6 +240,7 @@ pub struct SessionsSendTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
     channels: ChannelMapHandle,
+    conversation_histories: ConversationHistoryHandle,
 }
 
 impl SessionsSendTool {
@@ -242,11 +248,13 @@ impl SessionsSendTool {
         backend: Arc<dyn SessionBackend>,
         security: Arc<SecurityPolicy>,
         channels: ChannelMapHandle,
+        conversation_histories: ConversationHistoryHandle,
     ) -> Self {
         Self {
             backend,
             security,
             channels,
+            conversation_histories,
         }
     }
 }
@@ -337,7 +345,7 @@ impl Tool for SessionsSendTool {
         }
 
         // Persist to session backend regardless of channel delivery.
-        let chat_msg = crate::providers::traits::ChatMessage::assistant(message);
+        let chat_msg = ChatMessage::assistant(message);
 
         if let Err(e) = self.backend.append(session_id, &chat_msg) {
             return Ok(ToolResult {
@@ -345,6 +353,13 @@ impl Tool for SessionsSendTool {
                 output: String::new(),
                 error: Some(format!("Message delivered but failed to persist: {e}")),
             });
+        }
+
+        // Inject into in-memory conversation history so the receiving agent
+        // sees this message on its next turn without a restart.
+        if let Ok(mut histories) = self.conversation_histories.lock() {
+            let turns = histories.entry(session_id.to_string()).or_default();
+            turns.push(chat_msg);
         }
 
         let status = if delivered {
@@ -374,6 +389,10 @@ mod tests {
 
     fn empty_channel_map() -> ChannelMapHandle {
         Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn empty_history_handle() -> ConversationHistoryHandle {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     fn test_backend() -> (TempDir, Arc<dyn SessionBackend>) {
@@ -527,7 +546,7 @@ mod tests {
     #[tokio::test]
     async fn send_appends_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map());
+        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), empty_history_handle());
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -548,7 +567,7 @@ mod tests {
     #[tokio::test]
     async fn send_to_existing_session() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map());
+        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), empty_history_handle());
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -566,7 +585,7 @@ mod tests {
     #[tokio::test]
     async fn send_rejects_empty_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -581,7 +600,7 @@ mod tests {
     #[tokio::test]
     async fn send_rejects_empty_session_id() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool
             .execute(json!({
                 "session_id": "",
@@ -596,7 +615,7 @@ mod tests {
     #[tokio::test]
     async fn send_rejects_non_alphanumeric_session_id() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool
             .execute(json!({
                 "session_id": "///",
@@ -611,7 +630,7 @@ mod tests {
     #[tokio::test]
     async fn send_missing_session_id() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool.execute(json!({"message": "hi"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("session_id"));
@@ -620,7 +639,7 @@ mod tests {
     #[tokio::test]
     async fn send_missing_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool.execute(json!({"session_id": "telegram__alice"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("message"));
@@ -629,7 +648,7 @@ mod tests {
     #[test]
     fn send_tool_name_and_schema() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         assert_eq!(tool.name(), "sessions_send");
         let schema = tool.parameters_schema();
         assert!(schema["required"]
