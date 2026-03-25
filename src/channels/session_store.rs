@@ -25,16 +25,7 @@ impl SessionStore {
 
     /// Compute the file path for a session key, sanitizing for filesystem safety.
     fn session_path(&self, session_key: &str) -> PathBuf {
-        let safe_key: String = session_key
-            .chars()
-            .map(|c| {
-                if c.is_alphanumeric() || c == '_' || c == '-' {
-                    c
-                } else {
-                    '_'
-                }
-            })
-            .collect();
+        let safe_key = super::sanitize_session_key(session_key);
         self.sessions_dir.join(format!("{safe_key}.jsonl"))
     }
 
