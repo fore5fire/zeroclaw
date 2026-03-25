@@ -99,6 +99,7 @@ pub use whatsapp::WhatsAppChannel;
 #[cfg(feature = "whatsapp-web")]
 pub use whatsapp_web::WhatsAppWebChannel;
 
+use crate::channels::session_backend::SessionBackend as _;
 use crate::agent::loop_::{
     build_tool_instructions, clear_model_switch_request, get_model_switch_state,
     is_model_switch_requested, run_tool_call_loop, scrub_credentials,
@@ -431,16 +432,32 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
     }
 }
 
+/// Sanitize a session key so it matches the filesystem-safe form used by the
+/// JSONL session store.  This ensures keys round-trip through persist→list→load
+/// without mismatch.
+pub(crate) fn sanitize_session_key(raw: &str) -> String {
+    raw.chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
 fn conversation_history_key(msg: &traits::ChannelMessage) -> String {
     // Include reply_target for per-channel isolation (e.g. distinct Discord/Slack
     // channels) and thread_ts for per-topic isolation in forum groups.
-    match &msg.thread_ts {
+    let raw = match &msg.thread_ts {
         Some(tid) => format!(
             "{}_{}_{}_{}",
             msg.channel, msg.reply_target, tid, msg.sender
         ),
         None => format!("{}_{}_{}", msg.channel, msg.reply_target, msg.sender),
-    }
+    };
+    sanitize_session_key(&raw)
 }
 
 fn followup_thread_id(msg: &traits::ChannelMessage) -> Option<String> {
@@ -1170,6 +1187,40 @@ fn proactive_trim_turns(turns: &mut Vec<ChatMessage>, budget: usize) -> usize {
         turns.drain(..drop_count);
     }
     drop_count
+}
+
+/// Load persisted sessions from the session store into an in-memory history map.
+/// Each session is capped to the most recent [`MAX_CHANNEL_HISTORY`] messages so
+/// the context budget is respected.
+fn hydrate_histories_from_store(
+    store: &Option<Arc<session_store::SessionStore>>,
+) -> HashMap<String, Vec<ChatMessage>> {
+    let Some(store) = store else {
+        return HashMap::new();
+    };
+    let keys = store.list_sessions();
+    if keys.is_empty() {
+        return HashMap::new();
+    }
+    let mut histories = HashMap::with_capacity(keys.len());
+    for key in &keys {
+        let mut messages = store.load(key);
+        // Only keep non-system messages (system prompt is rebuilt per-turn).
+        messages.retain(|m| m.role != "system");
+        if messages.is_empty() {
+            continue;
+        }
+        // Cap to most recent turns.
+        if messages.len() > MAX_CHANNEL_HISTORY {
+            messages.drain(..messages.len() - MAX_CHANNEL_HISTORY);
+        }
+        histories.insert(key.clone(), messages);
+    }
+    tracing::info!(
+        "Hydrated {} session(s) from persisted store",
+        histories.len()
+    );
+    histories
 }
 
 fn append_sender_turn(ctx: &ChannelRuntimeContext, sender_key: &str, turn: ChatMessage) {
@@ -2424,6 +2475,18 @@ async fn process_channel_message(
             .get(&history_key)
             .is_some_and(|turns| !turns.is_empty())
     };
+
+    // Store the reply route so sessions_send can deliver to this session.
+    if let Some(ref store) = ctx.session_store {
+        let needs_update = store
+            .get_reply_route(&history_key)
+            .ok()
+            .flatten()
+            .map_or(true, |(ch, rt)| ch != msg.channel || rt != msg.reply_target);
+        if needs_update {
+            let _ = store.set_reply_route(&history_key, &msg.channel, &msg.reply_target);
+        }
+    }
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
     append_sender_turn(ctx.as_ref(), &history_key, ChatMessage::user(&msg.content));
@@ -4632,8 +4695,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
         mut built_tools,
         delegate_handle_ch,
         reaction_handle_ch,
-        _channel_map_handle,
+        channel_map_handle_ch,
         ask_user_handle_ch,
+        conversation_history_handle_ch,
     ) = tools::all_tools_with_runtime(
         Arc::new(config.clone()),
         &security,
@@ -4924,7 +4988,15 @@ pub async fn start_channels(config: Config) -> Result<()> {
             .collect::<HashMap<_, _>>(),
     );
 
-    // Populate the reaction tool's channel map now that channels are initialized.
+    // Populate tool channel maps now that channels are initialized.
+    // This shared handle is used by SessionsSendTool and PollTool.
+    {
+        let mut map = channel_map_handle_ch.write();
+        for (name, ch) in channels_by_name.as_ref() {
+            map.insert(name.clone(), Arc::clone(ch));
+        }
+    }
+
     if let Some(ref handle) = reaction_handle_ch {
         let mut map = handle.write();
         for (name, ch) in channels_by_name.as_ref() {
@@ -4932,7 +5004,6 @@ pub async fn start_channels(config: Config) -> Result<()> {
         }
     }
 
-    // Populate the ask_user tool's channel map now that channels are initialized.
     if let Some(ref handle) = ask_user_handle_ch {
         let mut map = handle.write();
         for (name, ch) in channels_by_name.as_ref() {
@@ -4974,6 +5045,23 @@ pub async fn start_channels(config: Config) -> Result<()> {
         .as_ref()
         .is_some_and(|mx| mx.interrupt_on_new_message);
 
+    // ── Session store (created early so we can hydrate conversation history) ──
+    let channel_session_store: Option<Arc<session_store::SessionStore>> =
+        if config.channels_config.session_persistence {
+            match session_store::SessionStore::new(&config.workspace_dir) {
+                Ok(store) => {
+                    tracing::info!("Session persistence enabled");
+                    Some(Arc::new(store))
+                }
+                Err(e) => {
+                    tracing::warn!("Session persistence disabled: {e}");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
     let runtime_ctx = Arc::new(ChannelRuntimeContext {
         channels_by_name,
         provider: Arc::clone(&provider),
@@ -4988,7 +5076,17 @@ pub async fn start_channels(config: Config) -> Result<()> {
         auto_save_memory: config.memory.auto_save,
         max_tool_iterations: config.agent.max_tool_iterations,
         min_relevance_score: config.memory.min_relevance_score,
-        conversation_histories: Arc::new(Mutex::new(HashMap::new())),
+        conversation_histories: {
+            // Hydrate the shared handle (also held by SessionsSendTool) from
+            // the persisted session store so conversations survive restarts.
+            let hydrated = hydrate_histories_from_store(&channel_session_store);
+            if let Ok(mut map) = conversation_history_handle_ch.lock() {
+                for (k, v) in hydrated {
+                    map.entry(k).or_insert(v);
+                }
+            }
+            conversation_history_handle_ch
+        },
         pending_new_sessions: Arc::new(Mutex::new(HashSet::new())),
         provider_cache: Arc::new(Mutex::new(provider_cache_seed)),
         route_overrides: Arc::new(Mutex::new(HashMap::new())),
@@ -5029,20 +5127,7 @@ pub async fn start_channels(config: Config) -> Result<()> {
         query_classification: config.query_classification.clone(),
         ack_reactions: config.channels_config.ack_reactions,
         show_tool_calls: config.channels_config.show_tool_calls,
-        session_store: if config.channels_config.session_persistence {
-            match session_store::SessionStore::new(&config.workspace_dir) {
-                Ok(store) => {
-                    tracing::info!("📂 Session persistence enabled");
-                    Some(Arc::new(store))
-                }
-                Err(e) => {
-                    tracing::warn!("Session persistence disabled: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        },
+        session_store: channel_session_store.clone(),
         approval_manager: Arc::new(ApprovalManager::for_non_interactive(&config.autonomy)),
         activated_tools: ch_activated_handle,
         cost_tracking: crate::cost::CostTracker::get_or_init_global(
@@ -10594,5 +10679,84 @@ This is an example JSON object for profile settings."#;
         let result = sanitize_channel_response(clean_text, &tools);
 
         assert_eq!(result, clean_text);
+    }
+
+    // ── hydrate_histories_from_store tests ──────────────────────────
+
+    #[test]
+    fn hydrate_histories_loads_persisted_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        store
+            .append(
+                "whatsapp_1234567890",
+                &ChatMessage::user("Hello"),
+            )
+            .unwrap();
+        store
+            .append(
+                "whatsapp_1234567890",
+                &ChatMessage::assistant("Hi there"),
+            )
+            .unwrap();
+        store
+            .append(
+                "telegram_bob",
+                &ChatMessage::user("Hey"),
+            )
+            .unwrap();
+
+        let histories = hydrate_histories_from_store(&Some(store));
+
+        assert_eq!(histories.len(), 2);
+        let wa = histories.get("whatsapp_1234567890").unwrap();
+        assert_eq!(wa.len(), 2);
+        assert_eq!(wa[0].role, "user");
+        assert_eq!(wa[1].role, "assistant");
+        let tg = histories.get("telegram_bob").unwrap();
+        assert_eq!(tg.len(), 1);
+    }
+
+    #[test]
+    fn hydrate_histories_returns_empty_without_store() {
+        let histories = hydrate_histories_from_store(&None);
+        assert!(histories.is_empty());
+    }
+
+    #[test]
+    fn hydrate_histories_skips_system_messages() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        store
+            .append("sess1", &ChatMessage::system("System prompt"))
+            .unwrap();
+        store
+            .append("sess1", &ChatMessage::user("Hello"))
+            .unwrap();
+
+        let histories = hydrate_histories_from_store(&Some(store));
+
+        let turns = histories.get("sess1").unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "user");
+    }
+
+    #[test]
+    fn hydrate_histories_caps_at_max_history() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let store = Arc::new(session_store::SessionStore::new(tmp.path()).unwrap());
+        // Write more than MAX_CHANNEL_HISTORY messages
+        for i in 0..(MAX_CHANNEL_HISTORY + 10) {
+            store
+                .append("sess1", &ChatMessage::user(&format!("msg {i}")))
+                .unwrap();
+        }
+
+        let histories = hydrate_histories_from_store(&Some(store));
+
+        let turns = histories.get("sess1").unwrap();
+        assert_eq!(turns.len(), MAX_CHANNEL_HISTORY);
+        // Should keep the most recent, not the oldest
+        assert_eq!(turns[0].content, format!("msg {}", 10));
     }
 }

@@ -82,6 +82,22 @@ impl SqliteSessionBackend {
             let _ = conn.execute("ALTER TABLE session_metadata ADD COLUMN name TEXT", []);
         }
 
+        // Migration: add reply route columns to existing databases
+        let has_channel: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM pragma_table_info('session_metadata') WHERE name = 'channel'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if !has_channel {
+            let _ = conn.execute("ALTER TABLE session_metadata ADD COLUMN channel TEXT", []);
+            let _ = conn.execute(
+                "ALTER TABLE session_metadata ADD COLUMN reply_target TEXT",
+                [],
+            );
+        }
+
         Ok(Self {
             conn: Mutex::new(conn),
             db_path,
@@ -355,6 +371,38 @@ impl SessionBackend for SqliteSessionBackend {
             |row| row.get(0),
         )
         .map_err(std::io::Error::other)
+    }
+
+    fn set_reply_route(
+        &self,
+        session_key: &str,
+        channel: &str,
+        reply_target: &str,
+    ) -> std::io::Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, channel, reply_target)
+             VALUES (?1, datetime('now'), datetime('now'), 0, ?2, ?3)
+             ON CONFLICT(session_key) DO UPDATE SET channel = ?2, reply_target = ?3",
+            params![session_key, channel, reply_target],
+        )
+        .map_err(std::io::Error::other)?;
+        Ok(())
+    }
+
+    fn get_reply_route(&self, session_key: &str) -> std::io::Result<Option<(String, String)>> {
+        let conn = self.conn.lock();
+        conn.query_row(
+            "SELECT channel, reply_target FROM session_metadata WHERE session_key = ?1",
+            params![session_key],
+            |row| {
+                let channel: Option<String> = row.get(0)?;
+                let reply_target: Option<String> = row.get(1)?;
+                Ok(channel.zip(reply_target))
+            },
+        )
+        .unwrap_or(None)
+        .map_or(Ok(None), |(c, r)| Ok(Some((c, r))))
     }
 
     fn search(&self, query: &SessionQuery) -> Vec<SessionMetadata> {

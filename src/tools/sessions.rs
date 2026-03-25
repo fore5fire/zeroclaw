@@ -5,14 +5,18 @@
 //! - `sessions_history` — read message history from a specific session
 //! - `sessions_send` — send a message to a specific session
 
+use super::poll::ChannelMapHandle;
 use super::traits::{Tool, ToolResult};
 use crate::channels::session_backend::SessionBackend;
+use crate::channels::traits::{Channel, SendMessage};
+use crate::providers::traits::ChatMessage;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
 use serde_json::json;
+use std::collections::HashMap;
 use std::fmt::Write;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 /// Validate that a session ID is non-empty and contains at least one
 /// alphanumeric character (prevents blank keys after sanitization).
@@ -204,15 +208,35 @@ impl Tool for SessionsHistoryTool {
 
 // ── SessionsSendTool ────────────────────────────────────────────────
 
+/// Shared handle for injecting messages into the in-memory conversation history.
+/// Populated by the channel server after startup; empty for gateway-only deployments.
+pub type ConversationHistoryHandle = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
+
 /// Sends a message to a specific session, enabling inter-agent communication.
+///
+/// When a channel map is available, the tool also delivers the message through
+/// the originating channel (e.g. WhatsApp, Telegram) so the remote user
+/// actually receives it.
 pub struct SessionsSendTool {
     backend: Arc<dyn SessionBackend>,
     security: Arc<SecurityPolicy>,
+    channels: ChannelMapHandle,
+    conversation_histories: ConversationHistoryHandle,
 }
 
 impl SessionsSendTool {
-    pub fn new(backend: Arc<dyn SessionBackend>, security: Arc<SecurityPolicy>) -> Self {
-        Self { backend, security }
+    pub fn new(
+        backend: Arc<dyn SessionBackend>,
+        security: Arc<SecurityPolicy>,
+        channels: ChannelMapHandle,
+        conversation_histories: ConversationHistoryHandle,
+    ) -> Self {
+        Self {
+            backend,
+            security,
+            channels,
+            conversation_histories,
+        }
     }
 }
 
@@ -223,7 +247,7 @@ impl Tool for SessionsSendTool {
     }
 
     fn description(&self) -> &str {
-        "Send a message to a specific session by its session ID. The message is appended to the session's conversation history as a 'user' message, enabling inter-agent communication."
+        "Send a message to a specific session by its session ID. The message is delivered through the originating channel (e.g. WhatsApp, Telegram) and appended to the session's conversation history."
     }
 
     fn parameters_schema(&self) -> serde_json::Value {
@@ -232,7 +256,7 @@ impl Tool for SessionsSendTool {
             "properties": {
                 "session_id": {
                     "type": "string",
-                    "description": "The target session ID (e.g. telegram__user123)"
+                    "description": "The target session ID (e.g. whatsapp_+1234567890)"
                 },
                 "message": {
                     "type": "string",
@@ -277,20 +301,63 @@ impl Tool for SessionsSendTool {
             });
         }
 
-        let chat_msg = crate::providers::traits::ChatMessage::user(message);
+        // Attempt to deliver through the channel if a reply route is stored.
+        let mut delivered = false;
+        if let Ok(Some((channel_name, reply_target))) =
+            self.backend.get_reply_route(session_id)
+        {
+            // Block-scoped read to drop the parking_lot guard before .await.
+            let channel: Option<Arc<dyn Channel>> = {
+                let channels = self.channels.read();
+                channels.get(channel_name.as_str()).cloned()
+            };
 
-        match self.backend.append(session_id, &chat_msg) {
-            Ok(()) => Ok(ToolResult {
-                success: true,
-                output: format!("Message sent to session '{session_id}'."),
-                error: None,
-            }),
-            Err(e) => Ok(ToolResult {
+            if let Some(ch) = channel {
+                let send_msg = SendMessage::new(message, &reply_target);
+                if let Err(e) = ch.send(&send_msg).await {
+                    return Ok(ToolResult {
+                        success: false,
+                        output: String::new(),
+                        error: Some(format!(
+                            "Failed to deliver message via channel '{channel_name}': {e}"
+                        )),
+                    });
+                }
+                delivered = true;
+            }
+        }
+
+        // Persist to session backend regardless of channel delivery.
+        let chat_msg = ChatMessage::assistant(message);
+
+        if let Err(e) = self.backend.append(session_id, &chat_msg) {
+            return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Failed to send message: {e}")),
-            }),
+                error: Some(format!("Failed to persist message: {e}")),
+            });
         }
+
+        // Inject into in-memory conversation history so the receiving agent
+        // sees this message on its next turn without a restart.
+        // Sanitize the key to match the format used by conversation_history_key.
+        let sanitized_key = crate::channels::sanitize_session_key(session_id);
+        if let Ok(mut histories) = self.conversation_histories.lock() {
+            let turns = histories.entry(sanitized_key).or_default();
+            turns.push(chat_msg);
+        }
+
+        let status = if delivered {
+            format!("Message delivered and saved to session '{session_id}'.")
+        } else {
+            format!("Message saved to session '{session_id}' (no channel available for delivery).")
+        };
+
+        Ok(ToolResult {
+            success: true,
+            output: status,
+            error: None,
+        })
     }
 }
 
@@ -299,10 +366,19 @@ mod tests {
     use super::*;
     use crate::channels::session_store::SessionStore;
     use crate::providers::traits::ChatMessage;
+    use parking_lot::RwLock;
     use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
         Arc::new(SecurityPolicy::default())
+    }
+
+    fn empty_channel_map() -> ChannelMapHandle {
+        Arc::new(RwLock::new(HashMap::new()))
+    }
+
+    fn empty_history_handle() -> ConversationHistoryHandle {
+        Arc::new(Mutex::new(HashMap::new()))
     }
 
     fn test_backend() -> (TempDir, Arc<dyn SessionBackend>) {
@@ -456,28 +532,46 @@ mod tests {
     #[tokio::test]
     async fn send_appends_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend.clone(), test_security());
+        let history = empty_history_handle();
+        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), Arc::clone(&history));
+
+        // Use a session_id with special characters (+, @) that get sanitized
+        // to underscores by the session store. The in-memory injection must
+        // use the sanitized key so it matches conversation_history_key lookups.
+        let raw_id = "whatsapp_+1234@s.whatsapp.net_+1234";
+        let sanitized_id = "whatsapp__1234_s_whatsapp_net__1234";
+
         let result = tool
             .execute(json!({
-                "session_id": "telegram__alice",
+                "session_id": raw_id,
                 "message": "Hello from another agent"
             }))
             .await
             .unwrap();
         assert!(result.success);
-        assert!(result.output.contains("Message sent"));
+        assert!(result.output.contains("Message saved"));
 
-        // Verify message was appended
-        let messages = backend.load("telegram__alice");
+        // Verify message was persisted to backend (load sanitizes internally)
+        let messages = backend.load(raw_id);
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages[0].role, "user");
+        assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[0].content, "Hello from another agent");
+
+        // Verify in-memory injection uses the SANITIZED key
+        let histories = history.lock().unwrap();
+        assert!(
+            histories.get(raw_id).is_none(),
+            "should not inject under raw unsanitized key"
+        );
+        assert_eq!(histories[sanitized_id].len(), 1);
+        assert_eq!(histories[sanitized_id][0].content, "Hello from another agent");
     }
 
     #[tokio::test]
     async fn send_to_existing_session() {
         let (_tmp, backend) = seeded_backend();
-        let tool = SessionsSendTool::new(backend.clone(), test_security());
+        let history = empty_history_handle();
+        let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), Arc::clone(&history));
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -490,12 +584,18 @@ mod tests {
         let messages = backend.load("telegram__alice");
         assert_eq!(messages.len(), 3);
         assert_eq!(messages[2].content, "Inter-agent message");
+
+        // In-memory history gets the new message even though it wasn't
+        // pre-populated with the seeded backend's messages.
+        let histories = history.lock().unwrap();
+        assert_eq!(histories["telegram__alice"].len(), 1);
+        assert_eq!(histories["telegram__alice"][0].role, "assistant");
     }
 
     #[tokio::test]
     async fn send_rejects_empty_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool
             .execute(json!({
                 "session_id": "telegram__alice",
@@ -510,7 +610,7 @@ mod tests {
     #[tokio::test]
     async fn send_rejects_empty_session_id() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool
             .execute(json!({
                 "session_id": "",
@@ -525,7 +625,7 @@ mod tests {
     #[tokio::test]
     async fn send_rejects_non_alphanumeric_session_id() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool
             .execute(json!({
                 "session_id": "///",
@@ -540,7 +640,7 @@ mod tests {
     #[tokio::test]
     async fn send_missing_session_id() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool.execute(json!({"message": "hi"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("session_id"));
@@ -549,7 +649,7 @@ mod tests {
     #[tokio::test]
     async fn send_missing_message() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         let result = tool.execute(json!({"session_id": "telegram__alice"})).await;
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("message"));
@@ -558,7 +658,7 @@ mod tests {
     #[test]
     fn send_tool_name_and_schema() {
         let (_tmp, backend) = test_backend();
-        let tool = SessionsSendTool::new(backend, test_security());
+        let tool = SessionsSendTool::new(backend, test_security(), empty_channel_map(), empty_history_handle());
         assert_eq!(tool.name(), "sessions_send");
         let schema = tool.parameters_schema();
         assert!(schema["required"]
@@ -570,4 +670,107 @@ mod tests {
             .unwrap()
             .contains(&json!("message")));
     }
+
+    // ── sessions_send channel delivery + in-memory injection tests ─
+
+    use crate::channels::traits::ChannelMessage;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    struct MockChannel {
+        sent: AtomicBool,
+        last_recipient: parking_lot::Mutex<Option<String>>,
+        last_content: parking_lot::Mutex<Option<String>>,
+    }
+
+    impl MockChannel {
+        fn new() -> Self {
+            Self {
+                sent: AtomicBool::new(false),
+                last_recipient: parking_lot::Mutex::new(None),
+                last_content: parking_lot::Mutex::new(None),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Channel for MockChannel {
+        fn name(&self) -> &str {
+            "mock"
+        }
+
+        async fn send(&self, message: &SendMessage) -> anyhow::Result<()> {
+            self.sent.store(true, Ordering::SeqCst);
+            *self.last_recipient.lock() = Some(message.recipient.clone());
+            *self.last_content.lock() = Some(message.content.clone());
+            Ok(())
+        }
+
+        async fn listen(
+            &self,
+            _tx: tokio::sync::mpsc::Sender<ChannelMessage>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn send_delivers_via_channel_and_injects_history() {
+        let (_tmp, backend) = test_backend();
+
+        // Store a reply route so sessions_send knows how to deliver.
+        let session_id = "whatsapp_14403198133";
+        let reply_target = "14403198133@s.whatsapp.net";
+        backend
+            .set_reply_route(session_id, "whatsapp", reply_target)
+            .unwrap();
+
+        let channel = Arc::new(MockChannel::new());
+        let channels: ChannelMapHandle = Arc::new(RwLock::new(HashMap::new()));
+        channels.write().insert("whatsapp".to_string(), channel.clone() as Arc<dyn Channel>);
+        let history: ConversationHistoryHandle = Arc::new(Mutex::new(HashMap::new()));
+
+        let tool = SessionsSendTool::new(
+            backend.clone(),
+            test_security(),
+            channels,
+            Arc::clone(&history),
+        );
+
+        let result = tool
+            .execute(json!({
+                "session_id": session_id,
+                "message": "Hello from cross-channel"
+            }))
+            .await
+            .unwrap();
+
+        // Tool reported success with delivery confirmation
+        assert!(result.success);
+        assert!(result.output.contains("delivered"));
+
+        // Channel's send() was called with the JID reply target, not the session key
+        assert!(channel.sent.load(Ordering::SeqCst));
+        assert_eq!(
+            *channel.last_recipient.lock(),
+            Some(reply_target.to_string())
+        );
+        assert_eq!(
+            *channel.last_content.lock(),
+            Some("Hello from cross-channel".to_string())
+        );
+
+        // Message was persisted to session backend
+        let messages = backend.load(session_id);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0].role, "assistant");
+        assert_eq!(messages[0].content, "Hello from cross-channel");
+
+        // Message was injected into in-memory conversation history
+        let histories = history.lock().unwrap();
+        let turns = histories.get(session_id).unwrap();
+        assert_eq!(turns.len(), 1);
+        assert_eq!(turns[0].role, "assistant");
+        assert_eq!(turns[0].content, "Hello from cross-channel");
+    }
+
 }
