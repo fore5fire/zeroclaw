@@ -359,8 +359,10 @@ impl Tool for SessionsSendTool {
 
         // Inject into in-memory conversation history so the receiving agent
         // sees this message on its next turn without a restart.
+        // Sanitize the key to match the format used by conversation_history_key.
+        let sanitized_key = crate::channels::sanitize_session_key(session_id);
         if let Ok(mut histories) = self.conversation_histories.lock() {
-            let turns = histories.entry(session_id.to_string()).or_default();
+            let turns = histories.entry(sanitized_key).or_default();
             turns.push(chat_msg);
         }
 
@@ -550,9 +552,16 @@ mod tests {
         let (_tmp, backend) = test_backend();
         let history = empty_history_handle();
         let tool = SessionsSendTool::new(backend.clone(), test_security(), empty_channel_map(), Arc::clone(&history));
+
+        // Use a session_id with special characters (+, @) that get sanitized
+        // to underscores by the session store. The in-memory injection must
+        // use the sanitized key so it matches conversation_history_key lookups.
+        let raw_id = "whatsapp_+1234@s.whatsapp.net_+1234";
+        let sanitized_id = "whatsapp__1234_s_whatsapp_net__1234";
+
         let result = tool
             .execute(json!({
-                "session_id": "telegram__alice",
+                "session_id": raw_id,
                 "message": "Hello from another agent"
             }))
             .await
@@ -560,16 +569,20 @@ mod tests {
         assert!(result.success);
         assert!(result.output.contains("Message saved"));
 
-        // Verify message was persisted to backend
-        let messages = backend.load("telegram__alice");
+        // Verify message was persisted to backend (load sanitizes internally)
+        let messages = backend.load(raw_id);
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].role, "assistant");
         assert_eq!(messages[0].content, "Hello from another agent");
 
-        // Verify message was injected into in-memory history
+        // Verify in-memory injection uses the SANITIZED key
         let histories = history.lock().unwrap();
-        assert_eq!(histories["telegram__alice"].len(), 1);
-        assert_eq!(histories["telegram__alice"][0].content, "Hello from another agent");
+        assert!(
+            histories.get(raw_id).is_none(),
+            "should not inject under raw unsanitized key"
+        );
+        assert_eq!(histories[sanitized_id].len(), 1);
+        assert_eq!(histories[sanitized_id][0].content, "Hello from another agent");
     }
 
     #[tokio::test]

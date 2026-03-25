@@ -435,7 +435,7 @@ fn conversation_memory_key(msg: &traits::ChannelMessage) -> String {
 /// Sanitize a session key so it matches the filesystem-safe form used by the
 /// JSONL session store.  This ensures keys round-trip through persist→list→load
 /// without mismatch.
-fn sanitize_session_key(raw: &str) -> String {
+pub(crate) fn sanitize_session_key(raw: &str) -> String {
     raw.chars()
         .map(|c| {
             if c.is_alphanumeric() || c == '_' || c == '-' {
