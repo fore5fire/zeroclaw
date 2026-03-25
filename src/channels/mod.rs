@@ -2609,6 +2609,7 @@ async fn process_channel_message(
     }
     let mut history = vec![ChatMessage::system(system_prompt)];
     history.extend(prior_turns);
+    let history_len_before_llm = history.len();
     let use_streaming = target_channel
         .as_ref()
         .is_some_and(|ch| ch.supports_draft_updates());
@@ -2985,21 +2986,16 @@ async fn process_channel_message(
                 }),
             );
 
-            // Previously we prepended a `[Used tools: …]` summary to the
-            // history entry so the LLM retained awareness of prior tool usage.
-            // This caused the model to learn and reproduce the bracket format
-            // in its own output, which leaked to end-users as raw log lines
-            // instead of meaningful responses (#4400).  The LLM already
-            // receives tool context through the tool-call/result messages in
-            // the conversation history built by `run_tool_call_loop`, so the
-            // extra summary prefix is unnecessary.
-            let history_response = delivered_response.clone();
-
-            append_sender_turn(
-                ctx.as_ref(),
-                &history_key,
-                ChatMessage::assistant(&history_response),
-            );
+            // Persist all turns added by run_tool_call_loop (tool calls,
+            // tool results, and the final assistant response) so that
+            // conversation state is fully restored after a restart.
+            // The user turn was already persisted before the LLM call.
+            for turn in history.iter().skip(history_len_before_llm) {
+                if turn.role == "system" {
+                    continue;
+                }
+                append_sender_turn(ctx.as_ref(), &history_key, turn.clone());
+            }
 
             // Fire-and-forget LLM-driven memory consolidation.
             if ctx.auto_save_memory && msg.content.chars().count() >= AUTOSAVE_MIN_MESSAGE_CHARS {
