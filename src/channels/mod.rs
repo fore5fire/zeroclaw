@@ -2478,7 +2478,14 @@ async fn process_channel_message(
 
     // Store the reply route so sessions_send can deliver to this session.
     if let Some(ref store) = ctx.session_store {
-        let _ = store.set_reply_route(&history_key, &msg.channel, &msg.reply_target);
+        let needs_update = store
+            .get_reply_route(&history_key)
+            .ok()
+            .flatten()
+            .map_or(true, |(ch, rt)| ch != msg.channel || rt != msg.reply_target);
+        if needs_update {
+            let _ = store.set_reply_route(&history_key, &msg.channel, &msg.reply_target);
+        }
     }
 
     // Preserve user turn before the LLM call so interrupted requests keep context.
@@ -5073,9 +5080,9 @@ pub async fn start_channels(config: Config) -> Result<()> {
             // Hydrate the shared handle (also held by SessionsSendTool) from
             // the persisted session store so conversations survive restarts.
             let hydrated = hydrate_histories_from_store(&channel_session_store);
-            if !hydrated.is_empty() {
-                if let Ok(mut map) = conversation_history_handle_ch.lock() {
-                    *map = hydrated;
+            if let Ok(mut map) = conversation_history_handle_ch.lock() {
+                for (k, v) in hydrated {
+                    map.entry(k).or_insert(v);
                 }
             }
             conversation_history_handle_ch
