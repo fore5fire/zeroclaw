@@ -5,6 +5,7 @@
 //! - `sessions_history` — read message history from a specific session
 //! - `sessions_send` — send a message to a specific session
 
+use super::poll::ChannelMapHandle;
 use super::traits::{Tool, ToolResult};
 use crate::channels::session_backend::SessionBackend;
 use crate::channels::traits::{Channel, SendMessage};
@@ -12,7 +13,6 @@ use crate::providers::traits::ChatMessage;
 use crate::security::policy::ToolOperation;
 use crate::security::SecurityPolicy;
 use async_trait::async_trait;
-use parking_lot::RwLock;
 use serde_json::json;
 use std::collections::HashMap;
 use std::fmt::Write;
@@ -208,28 +208,9 @@ impl Tool for SessionsHistoryTool {
 
 // ── SessionsSendTool ────────────────────────────────────────────────
 
-/// Shared handle giving tools late-bound access to the live channel map.
-type ChannelMapHandle = Arc<RwLock<HashMap<String, Arc<dyn Channel>>>>;
-
 /// Shared handle for injecting messages into the in-memory conversation history.
 /// Populated by the channel server after startup; empty for gateway-only deployments.
 pub type ConversationHistoryHandle = Arc<Mutex<HashMap<String, Vec<ChatMessage>>>>;
-
-/// Parse a session ID into (channel_name, recipient).
-///
-/// Session IDs follow the pattern `{channel}_{recipient}` where the channel
-/// name is the first `_`-delimited segment.  For compound keys like
-/// `whatsapp_+1234567890` or `telegram_some_reply_target_user`, we split on
-/// the first `_` only so the remainder is the full recipient/target.
-fn parse_session_channel(session_id: &str) -> Option<(&str, &str)> {
-    let pos = session_id.find('_')?;
-    let channel = &session_id[..pos];
-    let recipient = &session_id[pos + 1..];
-    if channel.is_empty() || recipient.is_empty() {
-        return None;
-    }
-    Some((channel, recipient))
-}
 
 /// Sends a message to a specific session, enabling inter-agent communication.
 ///
@@ -353,7 +334,7 @@ impl Tool for SessionsSendTool {
             return Ok(ToolResult {
                 success: false,
                 output: String::new(),
-                error: Some(format!("Message delivered but failed to persist: {e}")),
+                error: Some(format!("Failed to persist message: {e}")),
             });
         }
 
@@ -385,6 +366,7 @@ mod tests {
     use super::*;
     use crate::channels::session_store::SessionStore;
     use crate::providers::traits::ChatMessage;
+    use parking_lot::RwLock;
     use tempfile::TempDir;
 
     fn test_security() -> Arc<SecurityPolicy> {
@@ -687,27 +669,6 @@ mod tests {
             .as_array()
             .unwrap()
             .contains(&json!("message")));
-    }
-
-    // ── parse_session_channel tests ────────────────────────────────
-
-    #[test]
-    fn parse_session_channel_extracts_channel_and_recipient() {
-        let (ch, recipient) = parse_session_channel("whatsapp_+1234567890").unwrap();
-        assert_eq!(ch, "whatsapp");
-        assert_eq!(recipient, "+1234567890");
-
-        // Compound recipient: only splits on first underscore
-        let (ch, recipient) = parse_session_channel("telegram_reply_target_user").unwrap();
-        assert_eq!(ch, "telegram");
-        assert_eq!(recipient, "reply_target_user");
-    }
-
-    #[test]
-    fn parse_session_channel_rejects_invalid_ids() {
-        assert!(parse_session_channel("nounderscore").is_none());
-        assert!(parse_session_channel("_recipient").is_none());
-        assert!(parse_session_channel("channel_").is_none());
     }
 
     // ── sessions_send channel delivery + in-memory injection tests ─

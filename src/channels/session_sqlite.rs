@@ -381,8 +381,10 @@ impl SessionBackend for SqliteSessionBackend {
     ) -> std::io::Result<()> {
         let conn = self.conn.lock();
         conn.execute(
-            "UPDATE session_metadata SET channel = ?1, reply_target = ?2 WHERE session_key = ?3",
-            params![channel, reply_target, session_key],
+            "INSERT INTO session_metadata (session_key, created_at, last_activity, message_count, channel, reply_target)
+             VALUES (?1, datetime('now'), datetime('now'), 0, ?2, ?3)
+             ON CONFLICT(session_key) DO UPDATE SET channel = ?2, reply_target = ?3",
+            params![session_key, channel, reply_target],
         )
         .map_err(std::io::Error::other)?;
         Ok(())
